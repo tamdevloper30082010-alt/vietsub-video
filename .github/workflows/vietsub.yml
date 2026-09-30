@@ -1,0 +1,432 @@
+name: Vietsub video (Gemini)
+
+# Nhập URL + Audio detect ngay trong panel Run workflow — không cần job.json nữa.
+#   - URL: link video YouTube/TikTok/Facebook/direct mp4...  (BẮT BUỘC)
+#   - Audio detect: false = OCR phụ đề cứng (mặc định), true = nghe audio trực tiếp
+#   - output_mode: cách giao kết quả (auto/artifact/release/both)
+#   - max_video_mb: giới hạn dung lượng output (mặc định 500)
+#   - target_lang: ngôn ngữ đích (mặc định 'vi' = tiếng Việt; chừa cho mở rộng sau)
+#
+# Trước khi chạy:
+#   Settings → Secrets and variables → Actions → tạo secret GEMINI_API_KEY
+#   (lấy từ Google AI Studio — không cần thẻ tín dụng, free tier 15 RPM / 1.500 RPD).
+#   (tuỳ chọn) YT_COOKIES — cookies.txt nếu YouTube chặn IP runner.
+#
+# Model: gemini-2.5-flash (mặc định, mạnh nhất Gemini free tier).
+# Đổi qua CLI --model nếu muốn model khác — xem README.
+#
+# Chạy: Actions → "Vietsub video (Gemini)" → Run workflow → điền form.
+#
+# Cache: glossary + OCR cache lưu ở ~/.cache/vietsub/ (cache giữa các lần run,
+# invalidate khi source code đổi).
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "URL video (YouTube/TikTok/Facebook/direct mp4...)"
+        required: true
+        type: string
+        default: ""
+      audio_detect:
+        description: "Audio detect: false = OCR phụ đề cứng tiếng Trung trong video · true = nghe audio trực tiếp (bỏ qua OCR)"
+        required: false
+        type: boolean
+        default: false
+      output_mode:
+        description: "Cách giao kết quả"
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto      # file nhỏ→artifact, lớn→release (auto-shrink nếu >2GB)
+          - artifact  # ép ≤500MB, dùng upload-artifact
+          - release   # ép ≤2GB, tạo gh release
+          - both      # shrink về ≤500MB, upload cả 2
+      max_video_mb:
+        description: "Mức MB tối đa (mặc định 500 = vừa artifact; ≤2000 cho release)"
+        required: false
+        type: string
+        default: "500"
+      target_lang:
+        description: "Ngôn ngữ đích (mặc định 'vi' = tiếng Việt; chừa cho mở rộng)"
+        required: false
+        type: string
+        default: "vi"
+      force_no_cache:
+        description: "Bỏ qua cache glossary/OCR (force analyze lại + chạy OCR từ đầu). Bật khi nghi cache cũ bị lỗi."
+        required: false
+        type: boolean
+        default: false
+      ocr_bottom_ratio:
+        description: "OCR: tỷ lệ chiều cao khung hình dùng để OCR dải đáy (0.2-0.6). Mặc định 0.40. Tăng lên 0.5 nếu sub nằm giữa khung."
+        required: false
+        type: string
+        default: "0.40"
+      ocr_interval:
+        description: "OCR: khoảng cách giữa 2 frame OCR (giây). Mặc định 0.4. Giảm xuống 0.3 nếu sub thoáng qua."
+        required: false
+        type: string
+        default: "0.4"
+      ocr_conf:
+        description: "OCR: ngưỡng confidence tesseract (0-100). Mặc định 15. Tăng lên 25 nếu có nhiều text nhiễu."
+        required: false
+        type: string
+        default: "15"
+      srt_url:
+        description: "URL tới file SRT tiếng Trung (vd link catbox/dpaste/GitHub raw). Ưu tiên cao hơn srt_path. Để trống nếu muốn dùng OCR hoặc srt_path."
+        required: false
+        type: string
+        default: ""
+      srt_path:
+        description: "Đường dẫn file SRT tiếng Trung đã commit sẵn trong repo (vd 'subs/input.srt'). Mặc định 'input.srt'. Để trống nếu muốn dùng OCR hoặc srt_url."
+        required: false
+        type: string
+        default: ""
+      batch_size:
+        description: "Dịch: số cue gửi mỗi lần gọi Gemini. Mặc định 30 (auto-split xuống 15 nếu model cắt output). Tăng lên 50-60 nếu model mạnh."
+        required: false
+        type: string
+        default: "30"
+      gemini_model:
+        description: "Model Gemini (cập nhật T9/2026). gemini-3.8-flash = MỚI NHẤT, Google khuyến nghị cho user mới (default). gemini-3.5-flash-lite = quota rộng 500 RPD, dịch OK. gemini-2.5-flash = ĐÃ RETIRE cho user mới, tránh dùng."
+        required: false
+        type: choice
+        default: "gemini-3.8-flash"
+        options:
+          - gemini-3.8-flash         # DEFAULT · mới nhất · Google khuyến nghị cho new users
+          - gemini-3.7-flash         # mới · 20–1500 RPD · ★★★★★
+          - gemini-3.5-flash         # chất lượng cao · 20 RPD · ★★★★
+          - gemini-3.5-flash-lite    # quota rộng · 500 RPD · ★★★
+          - gemini-3.1-flash-lite    # ổn định · 500–1000 RPD · ★★★
+          - gemini-2.5-flash         # ⚠️ DEPRECATED — Google trả 404 cho user mới
+
+permissions:
+  contents: write   # cần cho gh release
+
+jobs:
+  vietsub:
+    runs-on: ubuntu-24.04
+    # Tăng từ 350 → 480 phút (8h) để chứa retry 503 lâu (~20 phút/cluster có thể lặp vài lần).
+    timeout-minutes: 480
+    env:
+      WORK: ${{ github.workspace }}/work
+      TARGET_LANG: ${{ inputs.target_lang }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Validate GEMINI_API_KEY. Lấy key từ https://aistudio.google.com/apikey (free tier,
+      # không cần thẻ tín dụng — 15 RPM / 1.500 RPD / 1M TPM).
+      - name: Kiểm tra secret GEMINI_API_KEY
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "::error::Thiếu secret GEMINI_API_KEY (Settings → Secrets → Actions)"
+            echo "::error::Lấy key tại: https://aistudio.google.com/apikey (free tier, không cần thẻ)"
+            exit 1
+          fi
+          echo "✓ GEMINI_API_KEY đã có"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: vietsub/requirements.txt
+
+      - name: Cài ffmpeg, tesseract (chi_sim/chi_tra/eng), font
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg tesseract-ocr tesseract-ocr-eng \
+            tesseract-ocr-chi-sim tesseract-ocr-chi-tra \
+            fonts-noto-core fonts-noto-cjk
+          fc-cache -f
+          pip install -r vietsub/requirements.txt
+
+      - name: Cache model Whisper
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-large-v3-turbo
+
+      - name: Cache glossary + OCR (giữa các lần run)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vietsub
+          key: vietsub-cache-v2-${{ hashFiles('vietsub/') }}
+          restore-keys: |
+            vietsub-cache-v2-
+
+      # Dọn OCR cache cũ (>30 ngày) để tránh phình cache khi dùng lâu dài.
+      # Glossary cache thì GIỮ cả (key = SHA256(transcript text), mỗi video 1 key khác nhau,
+      # nên không có nguy cơ collision; kích thước cũng rất nhỏ ~50KB/file).
+      # → Mỗi cache entry mới của video mới sẽ tự có key riêng, an toàn 100%.
+      - name: Dọn cache OCR cũ (>30 ngày)
+        run: |
+          BEFORE=$(du -sm ~/.cache/vietsub 2>/dev/null | cut -f1 || echo 0)
+          find ~/.cache/vietsub -name "ocr_*.json" -type f -mtime +30 -delete 2>/dev/null || true
+          AFTER=$(du -sm ~/.cache/vietsub 2>/dev/null | cut -f1 || echo 0)
+          echo "Cache size: ${BEFORE}MB → ${AFTER}MB (xóa ocr_*.json >30 ngày)"
+
+      - name: Lấy URL + Audio detect
+        id: job
+        env:
+          INPUT_URL: ${{ inputs.video_url }}
+          INPUT_AUDIO: ${{ inputs.audio_detect }}
+        run: |
+          set -euo pipefail
+          URL="$INPUT_URL"
+          AUDIO="$INPUT_AUDIO"
+
+          if [ -z "$URL" ]; then
+            echo "::error::Thiếu URL — nhập vào form Run workflow (trường bắt buộc)"
+            exit 1
+          fi
+
+          AUDIO="${AUDIO,,}"   # lowercase
+          case "$AUDIO" in
+            true|yes|1|on)  AUDIO=true  ;;
+            false|no|0|off|"") AUDIO=false ;;
+            *)              AUDIO=false ;;
+          esac
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "audio_detect=$AUDIO" >> "$GITHUB_OUTPUT"
+          echo "audio_detect=$AUDIO" >> "$GITHUB_ENV"
+          echo "✓ URL: $URL"
+          echo "✓ Audio detect: $AUDIO"
+          echo "✓ Target lang: ${TARGET_LANG:-vi}"
+
+      - name: Tải video
+        env:
+          VIDEO_URL: ${{ steps.job.outputs.url }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/dl" "$WORK/out"
+          if [ -n "${YT_COOKIES:-}" ]; then
+            printf '%s' "$YT_COOKIES" > "$WORK/cookies.txt"
+            COOKIE_ARGS=(--cookies "$WORK/cookies.txt")
+          else
+            COOKIE_ARGS=()
+          fi
+          yt-dlp -f "bv*+ba/b" --merge-output-format mp4 --no-playlist --restrict-filenames \
+            -o "$WORK/dl/%(title).80s.%(ext)s" "${COOKIE_ARGS[@]}" "$VIDEO_URL"
+          VIDEO="$(ls -S "$WORK"/dl/* | head -1)"
+          [ -n "$VIDEO" ] || { echo "::error::Tải video thất bại"; exit 1; }
+          echo "VIDEO=$VIDEO" >> "$GITHUB_ENV"
+          DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$VIDEO")"
+          echo "Video: $VIDEO (${DUR}s)"
+          if [ "$(printf '%.0f' "$DUR")" -gt 1800 ]; then
+            echo "::warning::Video dài hơn 30 phút — tốn nhiều phút runner"
+          fi
+          ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$VIDEO" \
+            | grep -q audio \
+            || { echo "::error::Video không có audio"; exit 1; }
+
+      - name: Tách audio 16k mono
+        run: |
+          ffmpeg -y -hide_banner -loglevel error -i "$VIDEO" -vn -ac 1 -ar 16000 "$WORK/audio.wav"
+
+      - name: Nhận dạng lời thoại (ASR — mode audio_detect=true)
+        if: env.audio_detect == 'true'
+        run: |
+          python vietsub/transcribe.py --audio "$WORK/audio.wav" \
+            --out "$WORK/transcript.json" --model large-v3-turbo --language zh
+          echo "DETECTED_LANG=$(python -c "import json;print(json.load(open('$WORK/transcript.json'))['language'])")" >> "$GITHUB_ENV"
+
+      # Lấy SRT tiếng Trung do user upload. Ưu tiên: srt_url > srt_path > OCR.
+      # Nếu thành công, set USE_SRT=true → workflow sẽ dùng cover=fixed ở step render
+      # (không cần OCR lại vùng chữ gốc, vì sub đã là soft sub).
+      - name: Lấy SRT tiếng Trung (ưu tiên cao nhất)
+        id: srt
+        env:
+          SRT_URL: ${{ inputs.srt_url }}
+          SRT_PATH: ${{ inputs.srt_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SRT_URL" ]; then
+            echo "::notice::Đang tải SRT từ URL: $SRT_URL"
+            if ! curl -fsSL --max-time 60 "$SRT_URL" -o "$WORK/input.srt"; then
+              echo "::error::Không tải được SRT từ $SRT_URL"; exit 1
+            fi
+            echo "✓ tải SRT: $(wc -c < "$WORK/input.srt") bytes"
+            echo "use_srt=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$SRT_PATH" ] && [ -f "$SRT_PATH" ]; then
+            echo "::notice::Dùng SRT từ repo: $SRT_PATH"
+            cp "$SRT_PATH" "$WORK/input.srt"
+            echo "✓ copy SRT: $(wc -c < "$WORK/input.srt") bytes"
+            echo "use_srt=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Không có SRT — sẽ dùng OCR (audio_detect=false) hoặc ASR (audio_detect=true)"
+            echo "use_srt=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Parse SRT → transcript.json (mode có SRT upload)
+        if: steps.srt.outputs.use_srt == 'true'
+        run: |
+          python vietsub/srt_prepare.py --in "$WORK/input.srt" --out "$WORK/transcript.json" --lang auto
+          echo "DETECTED_LANG=$(python -c "import json;print(json.load(open('$WORK/transcript.json'))['language'])")" >> "$GITHUB_ENV"
+
+      - name: OCR phụ đề cứng (fallback khi KHÔNG có SRT upload)
+        if: env.audio_detect == 'false' && steps.srt.outputs.use_srt != 'true'
+        run: |
+          # Nếu user bật force_no_cache, dùng --no-cache để OCR lại từ đầu
+          # (bỏ qua cache ocr_<hash>.json đã lưu từ run trước)
+          OCR_FLAGS=""
+          if [ "${{ inputs.force_no_cache }}" = "true" ]; then
+            OCR_FLAGS="--no-cache"
+          fi
+          python vietsub/ocr_segments.py --video "$VIDEO" --out "$WORK/transcript.json" \
+            --lang "chi_tra+chi_sim+eng" \
+            --conf "${{ inputs.ocr_conf }}" \
+            --bottom-ratio "${{ inputs.ocr_bottom_ratio }}" \
+            --interval "${{ inputs.ocr_interval }}" \
+            $OCR_FLAGS
+          echo "DETECTED_LANG=$(python -c "import json;print(json.load(open('$WORK/transcript.json'))['language'])")" >> "$GITHUB_ENV"
+
+      # Dịch bằng 1 GEMINI CALL DUY NHẤT (gộp analyze + dịch + glossary).
+      # Pipeline mới thay cho translate.py cũ (5-10 calls) — đơn giản hơn, ít fail hơn.
+      # Mặc định gemini-3.6-flash (20 RPD). 1 video = 1 call → quota đủ dùng 10-15 video/ngày.
+      # Các model khác (đổi qua panel gemini_model):
+      #   gemini-flash-latest         alias Google
+      #   gemini-3.6/3.7/3.8-flash    non-lite, 20 RPD free
+      #   gemini-3.5-flash-lite       500 RPD (hay trả output rỗng, không khuyến nghị)
+      #   gemini-3.1-pro-preview      Pro tier, cần billing GCP
+      - name: Dịch sang tiếng Việt (1 Gemini call duy nhất)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          # Tự build cờ --no-cache nếu user bật input force_no_cache
+          NO_CACHE_FLAG=""
+          if [ "${{ inputs.force_no_cache }}" = "true" ]; then
+            NO_CACHE_FLAG="--no-cache"
+            echo "⚠ force_no_cache=true → bỏ qua cache translate"
+          fi
+          # BỎ HẾT CÁC BATCH/REVIEW PARAMETERS — pipeline mới chỉ cần 1 call.
+          python vietsub/translate_srt.py \
+            --in "$WORK/transcript.json" \
+            --out "$WORK/segments_vi.srt" \
+            --segments-out "$WORK/segments_vi.json" \
+            --glossary-out "$WORK/glossary.json" \
+            --model "${{ inputs.gemini_model }}" \
+            --max-tokens 16000 --max-retries 6 \
+            $NO_CACHE_FLAG
+
+      - name: Che chữ gốc + burn chữ Việt (tận dụng OCR cache)
+        env:
+          AUDIO_DETECT: ${{ env.audio_detect }}
+          USE_SRT: ${{ steps.srt.outputs.use_srt }}
+        run: |
+          # Quyết định mode cover:
+          # - audio_detect=true        → fixed (ASR, không có sub cứng)
+          # - có SRT upload (USE_SRT=true) → fixed (sub đã soft, không có sub cứng)
+          # - audio_detect=false, không SRT → ocr (phải OCR để che sub cứng)
+          if [ "$AUDIO_DETECT" = "true" ] || [ "$USE_SRT" = "true" ]; then
+            COVER=fixed
+          else
+            COVER=ocr
+          fi
+          echo "Cover mode: $COVER (audio_detect=$AUDIO_DETECT, use_srt=$USE_SRT)"
+          python vietsub/render.py --video "$VIDEO" --segments "$WORK/segments_vi.json" \
+            --outdir "$WORK/out" --cover "$COVER" --transcript "$WORK/transcript.json" \
+            --ocr-langs "chi_tra+chi_sim+eng" --font "Noto Sans" --crf 18
+
+      - name: Đóng gói debug
+        run: |
+          mkdir -p "$WORK/out/debug"
+          cp "$WORK/transcript.json" "$WORK/glossary.json" "$WORK/segments_vi.json" \
+             "$WORK/translated.json.usage.json" "$WORK/out/debug/" 2>/dev/null || true
+
+      - name: Giao kết quả (artifact / release / both)
+        id: dispatch
+        env:
+          OUTPUT_MODE: ${{ inputs.output_mode }}
+          MAX_MB: ${{ inputs.max_video_mb }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          OUT="$(ls -S "$WORK/out"/*_vietsub.* 2>/dev/null | grep -E '\.(mp4|mkv|mov)$' | head -1 || true)"
+          if [ -z "$OUT" ]; then
+            echo "::error::Không tìm thấy file vietsub output (render có thể đã fail)"
+            exit 1
+          fi
+          MB=$(du -m "$OUT" | cut -f1)
+          echo "Output: $OUT (${MB}MB) · output_mode=$OUTPUT_MODE · max=${MAX_MB}MB"
+
+          # QUAN TRỌNG: dispatch.py phải đọc RENDERED OUTPUT ($OUT), không phải video gốc tải về ($VIDEO).
+          # Trước đây VIDEO_PATH=$VIDEO khiến dispatch đo nhầm size + upload nhầm video gốc thay vì video có sub.
+          VIDEO_PATH="$OUT" python vietsub/dispatch.py > "$WORK/dispatch.json"
+          cat "$WORK/dispatch.json" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # expose cho step sau
+          DO_ART=$(python -c "import json;d=json.load(open('$WORK/dispatch.json'));print(str(d['do_artifact']).lower())")
+          DO_REL=$(python -c "import json;d=json.load(open('$WORK/dispatch.json'));print(str(d['do_release']).lower())")
+          FILE_PATH=$(python -c "import json;d=json.load(open('$WORK/dispatch.json'));print(d['path'])")
+          echo "do_artifact=$DO_ART" >> "$GITHUB_OUTPUT"
+          echo "do_release=$DO_REL" >> "$GITHUB_OUTPUT"
+          echo "file_path=$FILE_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        if: steps.dispatch.outputs.do_artifact == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vietsub-${{ github.run_id }}
+          path: |
+            ${{ steps.dispatch.outputs.file_path }}
+            ${{ env.WORK }}/out/*_vietsub.srt
+            ${{ env.WORK }}/out/*_vietsub.ass
+            ${{ env.WORK }}/out/debug/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Tạo GitHub Release
+        if: steps.dispatch.outputs.do_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: vietsub-r${{ github.run_number }}-${{ github.run_id }}
+          TITLE: "Vietsub #${{ github.run_number }}"
+        run: |
+          set -euo pipefail
+          PATH_OUT="${{ steps.dispatch.outputs.file_path }}"
+          if [ ! -f "$PATH_OUT" ]; then
+            echo "::error::không thấy $PATH_OUT"; exit 1
+          fi
+          BASE="${PATH_OUT%.*}"
+          EXTRA=()
+          # srt/ass baseline theo tên video được shrink (đuôi _shrunk_Xmb) —
+          # trước đây $BASE.srt/.ass miss vì tên khác. Bây giờ luôn glob theo _vietsub.srt/.ass gốc.
+          for f in "$WORK"/out/*_vietsub.srt "$WORK"/out/*_vietsub.ass; do
+            [ -f "$f" ] && EXTRA+=("$f")
+          done
+          if [ -d "$WORK/out/debug" ]; then
+            for f in "$WORK"/out/debug/*; do
+              [ -f "$f" ] && EXTRA+=("$f")
+            done
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --cleanup-tags --yes >/dev/null
+          fi
+          NOTES=$(python -c "import json;d=json.load(open('$WORK/dispatch.json'));print(d['note'])")
+          gh release create "$TAG" "$PATH_OUT" "${EXTRA[@]}" \
+            --title "$TITLE" \
+            --notes "Tự động tạo bởi workflow run ${{ github.run_id }} · mode=${{ inputs.output_mode }} · $NOTES"
+          echo "✓ Release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+
+      - name: Tóm tắt
+        if: always()
+        run: |
+          {
+            echo "### Vietsub (Gemini)"
+            echo "- Video: \`$(basename "${VIDEO:-?}")\` · audio_detect=\`${AUDIO_DETECT:-?}\` · lang=\`${DETECTED_LANG:-?}\`"
+            echo "- output_mode=\`${OUTPUT_MODE:-auto}\` · max_mb=\`${MAX_MB:-500}\` · target_lang=\`${TARGET_LANG:-vi}\`"
+            if [ -f "$WORK/dispatch.json" ]; then
+              python -c 'import json,os; d=json.load(open(os.path.join(os.environ.get("WORK","work"),"dispatch.json"))); orig=float(d.get("original_mb",0)); final=float(d.get("final_mb",0)); arrow=" → ".join(f"{x:.1f}MB" for x in (orig,final) if x); print("- Dispatch: `%s` · %s · %s" % (d.get("path","?"), arrow or f"{final:.1f}MB", d.get("note","")))'
+            fi
+            if [ -f "$WORK/translated.json.usage.json" ]; then
+              python -c 'import json,os; u=json.load(open(os.path.join(os.environ.get("WORK","work"),"translated.json.usage.json"))); mdl=u.get("model","gemini-2.5-flash"); print("- Gemini usage: %d lượt · in=%s · out=%s tokens · model=\`%s\`" % (u.get("calls",0), format(u.get("in_tokens",0),","), format(u.get("out_tokens",0),","), mdl))'
+            fi
+            ls -lh "${WORK:-?}"/out/*_vietsub.* 2>/dev/null | awk '{print "- " $9 " (" $5 ")"}' || true
+          } >> "$GITHUB_STEP_SUMMARY"
